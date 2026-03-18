@@ -1,0 +1,51 @@
+.products-page { padding: 32px 0 80px; }
+.products-header { margin-bottom: 24px; }
+.page-title { font-size: 32px; font-weight: 800; }
+.page-sub { color: var(--text2); margin-top: 4px; }
+
+.filter-bar {
+  display: flex; flex-direction: column; gap: 14px; margin-bottom: 28px;
+  padding: 18px 20px;
+}
+.filter-search {
+  display: flex; align-items: center; gap: 10px;
+  background: var(--bg3); border: 1px solid var(--border);
+  border-radius: 8px; padding: 0 12px; height: 40px;
+  transition: border-color 0.2s;
+}
+.filter-search:focus-within { border-color: var(--accent); }
+.filter-search input { flex: 1; background: none; border: none; outline: none; color: var(--text); font-size: 14px; }
+.filter-controls {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+}
+.filter-select {
+  background: var(--bg3); border: 1px solid var(--border);
+  border-radius: 7px; padding: 7px 10px; color: var(--text);
+  font-size: 13px; outline: none; cursor: pointer;
+  transition: border-color 0.2s;
+}
+.filter-select:hover { border-color: var(--border2); }
+.trust-filter {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 12px; color: var(--text2);
+}
+.trust-filter strong { color: var(--accent2); }
+.trust-filter input[type=range] { accent-color: var(--accent); cursor: pointer; width: 80px; }
+
+.loading-center { display: flex; justify-content: center; padding: 80px; }
+
+.empty-state {
+  display: flex; flex-direction: column; align-items: center; gap: 16px;
+  padding: 80px; color: var(--text2); text-align: center;
+}
+
+.pagination {
+  display: flex; justify-content: center; gap: 8px; margin-top: 40px;
+}
+.page-btn {
+  width: 36px; height: 36px; border-radius: 8px; font-size: 14px;
+  background: var(--surface); border: 1px solid var(--border);
+  color: var(--text2); transition: all 0.15s;
+}
+.page-btn:hover { border-color: var(--accent); color: var(--accent2); }
+.page-btn.active { background: var(--accent); color: #fff; border-color: var(--accent); }

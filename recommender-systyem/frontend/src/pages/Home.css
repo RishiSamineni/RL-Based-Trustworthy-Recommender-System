@@ -1,0 +1,72 @@
+.home { padding-bottom: 80px; }
+
+/* Hero */
+.hero { position: relative; overflow: hidden; padding: 80px 0 60px; }
+.hero-glow {
+  position: absolute; top: -100px; left: 50%; transform: translateX(-50%);
+  width: 800px; height: 500px;
+  background: radial-gradient(ellipse, rgba(59,130,246,0.12) 0%, transparent 70%);
+  pointer-events: none;
+}
+.hero-inner { display: flex; flex-direction: column; align-items: center; text-align: center; gap: 20px; position: relative; }
+.hero-badge {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 6px 14px; border-radius: 20px;
+  background: rgba(59,130,246,0.1); border: 1px solid rgba(59,130,246,0.3);
+  font-size: 12px; font-weight: 600; color: var(--accent2);
+  text-transform: uppercase; letter-spacing: 0.5px;
+}
+.hero-title {
+  font-size: clamp(32px, 5vw, 56px); font-weight: 800;
+  max-width: 700px; line-height: 1.1;
+}
+.hero-accent {
+  background: linear-gradient(135deg, var(--accent2), var(--green2));
+  -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+}
+.hero-sub {
+  font-size: 16px; color: var(--text2); max-width: 560px; line-height: 1.7;
+}
+.hero-sub em { color: var(--accent2); font-style: normal; }
+.hero-actions { display: flex; gap: 12px; flex-wrap: wrap; justify-content: center; margin-top: 8px; }
+
+/* Stats strip */
+.stats-strip {
+  display: flex; gap: 0; margin-top: 40px;
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius-lg); overflow: hidden;
+  width: 100%; max-width: 600px;
+}
+.stat-item {
+  flex: 1; padding: 20px 16px; text-align: center;
+  border-right: 1px solid var(--border);
+}
+.stat-item:last-child { border-right: none; }
+.stat-value { font-family: var(--font-head); font-size: 28px; font-weight: 800; color: var(--accent2); }
+.stat-label { font-size: 12px; color: var(--text3); margin-top: 2px; }
+
+/* How it works */
+.how-section { padding: 60px 0; }
+.section-title { font-size: 28px; font-weight: 700; }
+.section-sub { color: var(--text2); font-size: 15px; margin-top: 6px; margin-bottom: 32px; }
+.section-header { display: flex; justify-content: space-between; align-items: flex-end; margin-bottom: 28px; }
+.how-card { display: flex; flex-direction: column; gap: 12px; }
+.how-icon {
+  width: 46px; height: 46px; border-radius: 12px;
+  display: flex; align-items: center; justify-content: center;
+}
+.how-title { font-size: 17px; font-weight: 700; }
+.how-desc { font-size: 14px; color: var(--text2); line-height: 1.6; }
+
+/* Formula */
+.formula-section { padding: 20px 0 60px; }
+.formula-card { text-align: center; }
+.formula-label { font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--text3); margin-bottom: 12px; }
+.formula-eq { font-family: var(--font-head); font-size: clamp(18px, 3vw, 26px); font-weight: 700; margin-bottom: 12px; flex-wrap: wrap; display: flex; justify-content: center; align-items: baseline; gap: 4px; }
+.f-op { color: var(--text3); }
+.f-w { color: var(--text2); font-size: 0.8em; }
+.formula-legend { display: flex; gap: 20px; justify-content: center; font-size: 13px; flex-wrap: wrap; }
+
+/* Products section */
+.products-section { padding: 20px 0 0; }
+.loading-center { display: flex; justify-content: center; padding: 60px; }

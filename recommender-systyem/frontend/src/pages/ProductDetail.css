@@ -1,0 +1,96 @@
+.product-detail { padding: 28px 0 80px; }
+.breadcrumb { font-size: 12px; color: var(--text3); margin-bottom: 24px; }
+.breadcrumb a { color: var(--accent2); }
+.breadcrumb a:hover { text-decoration: underline; }
+
+.detail-grid {
+  display: grid; grid-template-columns: 360px 1fr;
+  gap: 32px; margin-bottom: 60px;
+}
+@media (max-width: 900px) { .detail-grid { grid-template-columns: 1fr; } }
+
+/* Left */
+.detail-img-wrap { position: relative; border-radius: var(--radius-lg); overflow: hidden; margin-bottom: 20px; }
+.detail-img-wrap img { width: 100%; height: 240px; object-fit: cover; }
+.detail-img-badge { position: absolute; top: 12px; right: 12px; }
+
+/* Trust check panel */
+.trust-check-panel { display: flex; flex-direction: column; gap: 14px; }
+.tcp-header { display: flex; align-items: center; gap: 10px; }
+.tcp-header h3 { font-size: 15px; font-weight: 700; }
+.tcp-scores { display: flex; flex-direction: column; gap: 6px; }
+.tcp-score {
+  display: flex; justify-content: space-between; align-items: center;
+  font-size: 13px; color: var(--text2); padding: 6px 0;
+  border-bottom: 1px solid var(--border);
+}
+.tcp-score strong { font-size: 14px; font-weight: 700; }
+.tcp-threshold { display: flex; flex-direction: column; gap: 6px; }
+.tcp-threshold label { font-size: 12px; color: var(--text2); }
+.tcp-threshold input[type=range] { width: 100%; accent-color: var(--accent); cursor: pointer; }
+.tcp-reason { font-size: 12px; color: var(--text3); font-style: italic; }
+.trust-breakdown-wrap { padding-top: 12px; border-top: 1px solid var(--border); }
+
+/* Right */
+.detail-cat { font-size: 11px; margin-bottom: 8px; }
+.detail-title { font-size: clamp(22px, 3vw, 30px); font-weight: 800; line-height: 1.2; margin-bottom: 12px; }
+.detail-meta {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  margin-bottom: 16px;
+}
+.detail-price { font-size: 22px; font-weight: 800; color: var(--green2); margin-left: auto; }
+.detail-desc { color: var(--text2); line-height: 1.7; margin-bottom: 20px; font-size: 15px; }
+.detail-features { margin-bottom: 20px; }
+.detail-features h4 { font-size: 14px; font-weight: 700; margin-bottom: 10px; }
+.detail-features ul { list-style: none; display: flex; flex-direction: column; gap: 6px; }
+.detail-features li { font-size: 13px; color: var(--text2); display: flex; align-items: center; gap: 6px; }
+.detail-asin { font-size: 12px; color: var(--text3); margin-bottom: 20px; }
+.detail-asin code { background: var(--bg3); padding: 2px 8px; border-radius: 4px; color: var(--accent2); }
+
+/* Rating form */
+.rating-form { display: flex; flex-direction: column; gap: 12px; margin-bottom: 24px; }
+.rating-form-header { display: flex; align-items: center; gap: 8px; }
+.rating-form-header h4 { font-size: 15px; font-weight: 700; }
+.rating-stars-row { display: flex; align-items: center; gap: 12px; }
+.rating-val-label { font-size: 13px; color: var(--text3); }
+.review-input {
+  background: var(--bg3); border: 1px solid var(--border);
+  border-radius: 8px; padding: 10px 12px; color: var(--text);
+  font-size: 14px; resize: vertical; outline: none; transition: border-color 0.2s;
+}
+.review-input:focus { border-color: var(--accent); }
+
+/* Reviews */
+.reviews-section { display: flex; flex-direction: column; gap: 12px; }
+.reviews-section h4 { font-size: 15px; font-weight: 700; }
+.review-item {
+  background: var(--bg3); border: 1px solid var(--border);
+  border-radius: 10px; padding: 14px;
+  display: flex; flex-direction: column; gap: 8px;
+}
+.review-header { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.review-avatar {
+  width: 28px; height: 28px; border-radius: 50%;
+  background: linear-gradient(135deg, var(--accent), var(--purple));
+  display: flex; align-items: center; justify-content: center;
+  font-size: 12px; font-weight: 700; color: #fff; flex-shrink: 0;
+}
+.review-user { font-size: 13px; font-weight: 600; }
+.review-text { font-size: 13px; color: var(--text2); line-height: 1.6; }
+
+/* Similar */
+.similar-section { padding-top: 20px; }
+.sim-card-wrap { display: flex; flex-direction: column; gap: 8px; }
+.sim-meta { display: flex; align-items: center; gap: 8px; padding: 0 4px; }
+.explain-btn {
+  margin-left: auto; display: flex; align-items: center; gap: 4px;
+  background: none; border: 1px solid var(--border);
+  color: var(--text3); font-size: 11px; border-radius: 6px; padding: 3px 8px;
+  transition: all 0.15s;
+}
+.explain-btn:hover { border-color: var(--accent); color: var(--accent2); }
+.explain-panel { padding: 14px; }
+.explain-text {
+  font-size: 12px; color: var(--text2); white-space: pre-wrap;
+  font-family: var(--font-body); line-height: 1.6;
+}
