@@ -2,10 +2,22 @@
 Product similarity engine — faithful port of ProductSimilarity from product_similarity.py.
 Implements collaborative filtering, content-based filtering, and hybrid combination.
 """
-import numpy as np
+import math
 from collections import defaultdict
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
+
+
+def _mean(arr):
+    return float(sum(arr) / len(arr)) if arr else 0.0
+
+
+def _jaccard_similarity(a, b):
+    set_a = set(str(a).lower().split())
+    set_b = set(str(b).lower().split())
+    if not set_a or not set_b:
+        return 0.0
+    inter = len(set_a & set_b)
+    union = len(set_a | set_b)
+    return float(inter / union) if union else 0.0
 
 
 class SimilarityEngine:
@@ -19,7 +31,6 @@ class SimilarityEngine:
     """
 
     def __init__(self):
-        self.tfidf = TfidfVectorizer(max_features=500, stop_words='english')
         self._collab_cache = {}
         self._content_cache = {}
 
@@ -53,7 +64,8 @@ class SimilarityEngine:
             if data['count'] < 1:
                 continue
             freq_score = min(data['count'] / len(target_users), 1.0)
-            avg_r = np.mean(data['ratings'])
+            avg_r = _mean(data['ratings'])
+
             rating_sim = 1 - abs(target_avg - avg_r) / 5.0
             sim = 0.7 * freq_score + 0.3 * rating_sim
             similarities.append((asin, float(sim)))
@@ -110,8 +122,7 @@ class SimilarityEngine:
         if not t1 or not t2:
             return 0.0
         try:
-            mat = self.tfidf.fit_transform([t1, t2])
-            return float(cosine_similarity(mat[0:1], mat[1:2])[0][0])
+            return _jaccard_similarity(t1, t2)
         except Exception:
             return 0.0
 

@@ -2,9 +2,41 @@
 Trust scoring engine — faithful port of TrustworthyRecommender from trust_model.py.
 Works on the SQLAlchemy models instead of raw DataFrames so the web API can use it.
 """
-import numpy as np
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
+import math
+import statistics
+
+
+def _mean(arr):
+    return float(sum(arr) / len(arr)) if arr else 0.0
+
+
+def _std(arr):
+    if not arr or len(arr) < 2:
+        return 0.0
+    return float(statistics.pstdev(arr))
+
+
+def _median(arr):
+    return float(statistics.median(arr)) if arr else 0.0
+
+
+def _clip(value, min_val, max_val):
+    return float(max(min(value, max_val), min_val))
+
+
+def _nanmean(arr):
+    clean = [x for x in arr if x is not None and (not isinstance(x, float) or not math.isnan(x))]
+    return _mean(clean) if clean else 0.0
+
+
+def _jaccard_similarity(a, b):
+    a_tokens = set(str(a).lower().split())
+    b_tokens = set(str(b).lower().split())
+    if not a_tokens or not b_tokens:
+        return 0.0
+    intersection = a_tokens.intersection(b_tokens)
+    union = a_tokens.union(b_tokens)
+    return float(len(intersection) / len(union)) if union else 0.0
 
 
 class TrustEngine:
@@ -14,7 +46,7 @@ class TrustEngine:
     """
 
     def __init__(self):
-        self.tfidf = TfidfVectorizer(max_features=500, stop_words='english')
+        pass
 
     # ------------------------------------------------------------------
     # USER TRUST  (mirrors user_trust_score)
@@ -27,24 +59,24 @@ class TrustEngine:
         if not ratings_qs:
             return 0.5
 
-        verified_flags = [r.verified_purchase for r in ratings_qs]
+        verified_flags = [bool(r.verified_purchase) for r in ratings_qs]
         v_ratio = sum(verified_flags) / len(verified_flags)
 
-        helpful = [r.helpful_votes for r in ratings_qs]
-        h_mean = np.mean(helpful) if helpful else 0.0
-        h_ratio = h_mean / max(h_mean + 1, 1)
+        helpful = [float(r.helpful_votes or 0) for r in ratings_qs]
+        h_mean = _mean(helpful)
+        h_ratio = h_mean / max(h_mean + 1.0, 1.0)
 
-        raw_ratings = [r.rating for r in ratings_qs]
-        rating_std = float(np.std(raw_ratings)) if len(raw_ratings) > 1 else 0.0
-        c_rating = 1 - (rating_std / 2.0)
+        raw_ratings = [float(r.rating or 0.0) for r in ratings_qs]
+        rating_std = _std(raw_ratings)
+        c_rating = 1.0 - (rating_std / 2.0)
 
-        text_lens = [len(r.review_text or '') for r in ratings_qs]
-        median_len = float(np.median(text_lens)) if text_lens else 1.0
-        mean_len = float(np.mean(text_lens)) if text_lens else 0.0
-        q_text = float(np.clip(mean_len / max(median_len, 10), 0, 1))
+        text_lens = [len(str(r.review_text or '')) for r in ratings_qs]
+        median_len = _median(text_lens) if text_lens else 1.0
+        mean_len = _mean(text_lens) if text_lens else 0.0
+        q_text = _clip(mean_len / max(median_len, 10.0), 0.0, 1.0)
 
         score = 0.30 * v_ratio + 0.25 * h_ratio + 0.20 * c_rating + 0.25 * q_text
-        return float(np.clip(score, 0.0, 1.0))
+        return _clip(score, 0.0, 1.0)
 
     # ------------------------------------------------------------------
     # PRODUCT TRUST  (mirrors product_trust_score with return_details=True)
@@ -67,36 +99,35 @@ class TrustEngine:
                 'title_similarity': 0.0,
             }
 
-        raw_ratings = [r.rating for r in ratings_qs]
-        avg_rating = float(np.mean(raw_ratings))
+        raw_ratings = [float(r.rating or 0.0) for r in ratings_qs]
+        avg_rating = _mean(raw_ratings)
         n = len(ratings_qs)
 
-        verified_flags = [r.verified_purchase for r in ratings_qs]
+        verified_flags = [bool(r.verified_purchase) for r in ratings_qs]
         v_share = sum(verified_flags) / n
 
-        rn_conf = 1 - np.exp(-n / 1000.0)
+        rn_conf = 1.0 - math.exp(-n / 1000.0)
 
-        text_lens = [len(r.review_text or '') for r in ratings_qs]
-        text_quality = float(np.clip(np.mean(text_lens) / 500.0, 0, 1))
+        text_lens = [len(str(r.review_text or '')) for r in ratings_qs]
+        text_quality = _clip(_mean(text_lens) / 500.0, 0.0, 1.0)
 
         # Price abnormality
         price_factor = 1.0
         try:
-            if mean_price and product.price and product.price > 0:
+            if mean_price and product.price and product.price > 0.0:
                 diff = abs(product.price - mean_price) / float(mean_price)
                 price_factor = 1.0 - min(diff, 1.0)
         except Exception:
             price_factor = 1.0
 
-        # Title ↔ review TF-IDF similarity
+        # Title ↔ review text similarity fallback (no sklearn)
         title_sim = 0.0
         try:
-            title = product.title or ''
-            texts = [title] + [r.review_text or '' for r in ratings_qs if r.review_text]
-            if len(texts) > 1:
-                mat = self.tfidf.fit_transform(texts)
-                sims = cosine_similarity(mat[0:1], mat[1:])
-                title_sim = float(sims.mean())
+            title = str(product.title or '')
+            reviews = [str(r.review_text or '') for r in ratings_qs if r.review_text]
+            if title and reviews:
+                scores = [_jaccard_similarity(title, text) for text in reviews]
+                title_sim = _mean(scores)
         except Exception:
             title_sim = 0.0
 
@@ -107,7 +138,7 @@ class TrustEngine:
             0.15 * price_factor +
             0.15 * title_sim
         )
-        p_trust = float(np.clip(p_trust, 0, 1))
+        p_trust = _clip(p_trust, 0.0, 1.0)
 
         return {
             'product_trust': p_trust,
@@ -133,7 +164,7 @@ class TrustEngine:
         for prod, ratings in category_products_ratings:
             d = self.product_trust_score(prod, ratings, mean_price)
             scores.append(d['product_trust'])
-        return float(np.nanmean(scores)) if scores else 0.5
+        return _mean(scores) if scores else 0.5
 
     # ------------------------------------------------------------------
     # FINAL COMBINED SCORE  (mirrors final_product_score)
