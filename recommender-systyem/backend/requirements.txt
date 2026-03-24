@@ -5,3 +5,5 @@ flask-jwt-extended==4.6.0
 werkzeug==3.0.3
 pandas==2.2.3
 sqlalchemy==2.0.31
+numpy==1.26.4
+scikit-learn==1.4.2
