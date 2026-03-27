@@ -127,15 +127,32 @@ export default function Products() {
         {/* Pagination */}
         {pages > 1 && (
           <div className="pagination">
-            {Array.from({ length: pages }, (_, i) => i + 1).map(pg => (
-              <button key={pg}
-                className={`page-btn ${pg === page ? 'active' : ''}`}
-                onClick={() => { const p = new URLSearchParams(searchParams); p.set('page', pg); setSearchParams(p); }}>
-                {pg}
-              </button>
-            ))}
-          </div>
-        )}
+            <button className="page-btn"
+      onClick={() => {
+        const p = new URLSearchParams(searchParams);
+        p.set('page', page - 1);
+        setSearchParams(p);
+      }}
+      disabled={page === 1}
+    >
+      &#8592;
+    </button>
+
+    <span className="page-info">{page} / {pages}</span>
+
+    <button
+      className="page-btn"
+      onClick={() => {
+        const p = new URLSearchParams(searchParams);
+        p.set('page', page + 1);
+        setSearchParams(p);
+      }}
+      disabled={page === pages}
+    >
+      &#8594;
+    </button>
+  </div>
+)}
       </div>
     </div>
   );

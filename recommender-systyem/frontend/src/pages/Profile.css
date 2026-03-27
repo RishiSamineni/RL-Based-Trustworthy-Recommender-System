@@ -27,3 +27,15 @@
 .rr-date { display: flex; align-items: center; gap: 4px; font-size: 11px; color: var(--text3); }
 .loading-center { display: flex; justify-content: center; padding: 60px; }
 .empty-state { display: flex; flex-direction: column; align-items: center; gap: 14px; padding: 60px; color: var(--text2); }
+.page-info {
+  font-size: 14px;
+  color: var(--text2);
+  min-width: 60px;
+  text-align: center;
+}
+
+.page-btn:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+  pointer-events: none;
+}
