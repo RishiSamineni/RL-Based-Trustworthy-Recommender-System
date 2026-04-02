@@ -10,7 +10,6 @@ api.interceptors.request.use(cfg => {
   if (token) cfg.headers.Authorization = `Bearer ${token}`;
   return cfg;
 });
-
 // ── AUTH ─────────────────────────
 export const authAPI = {
   register: (data) => api.post('/auth/register', data),
