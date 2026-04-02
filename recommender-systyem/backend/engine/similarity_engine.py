@@ -1,183 +1,151 @@
+# backend/engine/similarity_engine.py
 """
-similarity_engine.py — FIXED VERSION
-Bugs fixed vs. your submitted file:
-  1. np.mean() on list of dicts used directly — now uses _mean() helper correctly
-  2. target_avg was computed with np.mean() but _mean() helper existed — unified
-  3. TfidfVectorizer removed from class (unused, was causing stale import issues)
-  4. All edge-cases guarded (empty lists, zero division, None values)
+Hybrid product similarity (collaborative + content-based).
+Replaces product_similarity.py — self-contained inside engine/.
 """
+
 import numpy as np
+import pandas as pd
 from collections import defaultdict
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
 
-def _mean(arr):
-    """Safe mean — returns 0.0 for empty lists."""
-    return float(np.mean(arr)) if arr else 0.0
-
-
-def _jaccard_similarity(a, b):
-    set_a = set(str(a).lower().split())
-    set_b = set(str(b).lower().split())
-    if not set_a or not set_b:
-        return 0.0
-    inter = len(set_a & set_b)
-    union = len(set_a | set_b)
-    return float(inter / union) if union else 0.0
-
-
 class SimilarityEngine:
     """
-    Mirrors ProductSimilarity from product_similarity.py.
-    All methods operate on plain Python dicts.
+    Computes hybrid product similarity combining:
+      • Collaborative filtering — co-review patterns ("users who reviewed X also Y")
+      • Content-based          — category, title TF-IDF, price proximity, features
     """
 
-    def __init__(self):
-        self._tfidf         = TfidfVectorizer(max_features=500, stop_words='english')
+    def __init__(self, df_reviews: pd.DataFrame, df_products: pd.DataFrame):
+        self.df_reviews  = df_reviews
+        self.df_products = df_products
+        self.tfidf       = TfidfVectorizer(max_features=500, stop_words="english")
         self._collab_cache  = {}
         self._content_cache = {}
 
-    # ── COLLABORATIVE FILTERING ───────────────────────────────────────────────
-    def calculate_collaborative_similarity(self, target_asin, all_ratings, top_n=50):
-        """
-        all_ratings : list of dicts {'user_id', 'product_asin', 'rating'}
-        Returns     : list of (asin, score) sorted desc
-        """
+    # ── collaborative ─────────────────────────────────────────────────────────
+    def collaborative(self, target_asin: str, top_n: int = 50) -> list:
         if target_asin in self._collab_cache:
             return self._collab_cache[target_asin][:top_n]
 
-        target_users = {r['user_id'] for r in all_ratings if r['product_asin'] == target_asin}
-        if not target_users:
+        target_rev = self.df_reviews[self.df_reviews["asin"] == target_asin]
+        if target_rev.empty:
             return []
 
-        target_ratings = [r['rating'] for r in all_ratings if r['product_asin'] == target_asin]
-        if not target_ratings:
-            return []
+        uid_col = "user_id" if "user_id" in self.df_reviews.columns else "reviewerID"
+        target_users = set(target_rev[uid_col].unique())
+        peer_rev     = self.df_reviews[self.df_reviews[uid_col].isin(target_users)]
 
-        # BUG FIX: was np.mean([r['rating'] for r in target_ratings])
-        # target_ratings is already a list of floats — _mean() is correct here
-        target_avg = _mean(target_ratings)
+        scores: dict = defaultdict(lambda: {"count": 0, "ratings": []})
+        for _, row in peer_rev.iterrows():
+            a = row["asin"]
+            if a != target_asin:
+                scores[a]["count"] += 1
+                scores[a]["ratings"].append(row.get("rating", 5.0))
 
-        product_data = defaultdict(lambda: {'count': 0, 'ratings': []})
-        for r in all_ratings:
-            if r['user_id'] in target_users and r['product_asin'] != target_asin:
-                product_data[r['product_asin']]['count'] += 1
-                product_data[r['product_asin']]['ratings'].append(r['rating'])
-
-        similarities = []
-        for asin, data in product_data.items():
-            if data['count'] < 1:
+        target_avg = float(target_rev["rating"].mean()) if "rating" in target_rev.columns else 5.0
+        sims = []
+        for asin, data in scores.items():
+            if data["count"] < 1:
                 continue
-            freq_score = min(data['count'] / len(target_users), 1.0)
-            avg_r      = _mean(data['ratings'])
-            rating_sim = 1 - abs(target_avg - avg_r) / 5.0
-            sim        = 0.7 * freq_score + 0.3 * rating_sim
-            similarities.append((asin, float(sim)))
+            freq_score   = min(data["count"] / max(len(target_users), 1), 1.0)
+            avg_r        = float(np.mean(data["ratings"]))
+            rating_sim   = 1.0 - abs(target_avg - avg_r) / 5.0
+            sims.append((asin, 0.7 * freq_score + 0.3 * rating_sim))
 
-        similarities.sort(key=lambda x: x[1], reverse=True)
-        self._collab_cache[target_asin] = similarities
-        return similarities[:top_n]
+        sims.sort(key=lambda x: x[1], reverse=True)
+        self._collab_cache[target_asin] = sims
+        return sims[:top_n]
 
-    # ── CONTENT-BASED FILTERING ───────────────────────────────────────────────
-    def calculate_content_similarity(self, target_asin, all_products, top_n=50):
-        """
-        all_products : list of dicts {asin, title, category, price, features}
-        Returns      : list of (asin, score) sorted desc
-        """
+    # ── content-based ─────────────────────────────────────────────────────────
+    def content(self, target_asin: str, top_n: int = 50) -> list:
         if target_asin in self._content_cache:
             return self._content_cache[target_asin][:top_n]
 
-        target = next((p for p in all_products if p['asin'] == target_asin), None)
-        if not target:
+        tgt_rows = self.df_products[self.df_products["asin"] == target_asin]
+        if tgt_rows.empty:
             return []
+        tgt = tgt_rows.iloc[0]
 
-        similarities = []
-        for p in all_products:
-            if p['asin'] == target_asin:
+        sims = []
+        for _, prod in self.df_products.iterrows():
+            if prod["asin"] == target_asin:
                 continue
-            cat_sim   = self._category_similarity(target, p)
-            title_sim = self._title_similarity(target, p)
-            price_sim = self._price_similarity(target, p)
-            feat_sim  = self._feature_similarity(target, p)
-            score     = 0.40*cat_sim + 0.30*title_sim + 0.20*price_sim + 0.10*feat_sim
-            similarities.append((p['asin'], float(score)))
+            cat_s  = self._cat_sim(tgt, prod)
+            title_s = self._title_sim(tgt, prod)
+            price_s = self._price_sim(tgt, prod)
+            feat_s  = self._feat_sim(tgt, prod)
+            total   = 0.40*cat_s + 0.30*title_s + 0.20*price_s + 0.10*feat_s
+            sims.append((prod["asin"], total))
 
-        similarities.sort(key=lambda x: x[1], reverse=True)
-        self._content_cache[target_asin] = similarities
-        return similarities[:top_n]
+        sims.sort(key=lambda x: x[1], reverse=True)
+        self._content_cache[target_asin] = sims
+        return sims[:top_n]
 
-    def _category_similarity(self, p1, p2):
-        try:
-            c1 = str(p1.get('category', '') or '')
-            c2 = str(p2.get('category', '') or '')
-            if not c1 or not c2:
-                return 0.5
-            if c1 == c2:
-                return 1.0
-            if c1.lower() in c2.lower() or c2.lower() in c1.lower():
-                return 0.7
-            return 0.0
-        except Exception:
+    def _cat_sim(self, p1, p2) -> float:
+        c1, c2 = str(p1.get("main_category","")).lower(), str(p2.get("main_category","")).lower()
+        if not c1 or not c2 or c1 == "nan" or c2 == "nan":
             return 0.5
+        if c1 == c2:      return 1.0
+        if c1 in c2 or c2 in c1: return 0.7
+        return 0.0
 
-    def _title_similarity(self, p1, p2):
+    def _title_sim(self, p1, p2) -> float:
+        t1, t2 = str(p1.get("title","")), str(p2.get("title",""))
+        if not t1 or not t2:
+            return 0.0
         try:
-            t1 = str(p1.get('title', '') or '')
-            t2 = str(p2.get('title', '') or '')
-            if not t1 or not t2:
-                return 0.0
-            return _jaccard_similarity(t1, t2)
+            mat = self.tfidf.fit_transform([t1, t2])
+            return float(cosine_similarity(mat[0:1], mat[1:2])[0][0])
         except Exception:
             return 0.0
 
-    def _price_similarity(self, p1, p2):
+    def _price_sim(self, p1, p2) -> float:
         try:
-            pr1 = float(p1.get('price', 0) or 0)
-            pr2 = float(p2.get('price', 0) or 0)
-            if pr1 == 0 or pr2 == 0:
+            v1 = float(pd.to_numeric(p1.get("price", 0), errors="coerce") or 0)
+            v2 = float(pd.to_numeric(p2.get("price", 0), errors="coerce") or 0)
+            if v1 == 0 or v2 == 0:
                 return 0.5
-            diff = abs(pr1 - pr2) / max(pr1, pr2)
-            return 1.0 - min(diff, 1.0)
+            return float(1.0 - min(abs(v1 - v2) / max(v1, v2), 1.0))
         except Exception:
             return 0.5
 
-    def _feature_similarity(self, p1, p2):
+    def _feat_sim(self, p1, p2) -> float:
         try:
-            f1 = set(str(x).lower() for x in (p1.get('features') or []) if x)
-            f2 = set(str(x).lower() for x in (p2.get('features') or []) if x)
+            f1 = set(str(x).lower() for x in (p1.get("features") or []) if pd.notna(x))
+            f2 = set(str(x).lower() for x in (p2.get("features") or []) if pd.notna(x))
             if not f1 or not f2:
                 return 0.5
-            inter = len(f1 & f2)
-            union = len(f1 | f2)
-            return float(inter / union) if union > 0 else 0.0
+            return len(f1 & f2) / len(f1 | f2)
         except Exception:
             return 0.5
 
-    # ── HYBRID ────────────────────────────────────────────────────────────────
-    def calculate_hybrid_similarity(self, target_asin, all_ratings, all_products,
-                                     top_n=50, collab_w=0.6, content_w=0.4):
+    # ── hybrid ────────────────────────────────────────────────────────────────
+    def hybrid(
+        self,
+        target_asin: str,
+        top_n: int = 50,
+        collab_w: float = 0.6,
+        content_w: float = 0.4,
+    ) -> list:
         """
-        Returns list of (asin, hybrid_score, {'collaborative': ..., 'content': ...})
+        Returns list of (asin, hybrid_score, {collaborative, content}) tuples.
         """
-        collab  = dict(self.calculate_collaborative_similarity(target_asin, all_ratings, 100))
-        content = dict(self.calculate_content_similarity(target_asin, all_products, 100))
+        collab_dict  = dict(self.collaborative(target_asin, top_n=100))
+        content_dict = dict(self.content(target_asin, top_n=100))
+        all_asins    = set(collab_dict) | set(content_dict)
 
-        all_asins = set(collab) | set(content)
-        results   = []
+        results = []
         for asin in all_asins:
-            cs     = collab.get(asin, 0.0)
-            co     = content.get(asin, 0.0)
-            hybrid = collab_w * cs + content_w * co
-            results.append((asin, float(hybrid), {'collaborative': cs, 'content': co}))
+            cs = collab_dict.get(asin, 0.0)
+            ct = content_dict.get(asin, 0.0)
+            results.append((
+                asin,
+                collab_w * cs + content_w * ct,
+                {"collaborative": cs, "content": ct},
+            ))
 
         results.sort(key=lambda x: x[1], reverse=True)
         return results[:top_n]
-
-    def invalidate_cache(self, asin=None):
-        if asin:
-            self._collab_cache.pop(asin, None)
-            self._content_cache.pop(asin, None)
-        else:
-            self._collab_cache.clear()
-            self._content_cache.clear()

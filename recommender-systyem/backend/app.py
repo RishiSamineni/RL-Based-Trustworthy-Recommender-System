@@ -1,37 +1,109 @@
-from flask import Flask
+from flask import Flask, jsonify, request
 from flask_cors import CORS
-from config import Config
-from extensions import db, jwt
+
+# 🔥 IMPORT YOUR PIPELINE
+from engine.trust_pipeline import TrustPipeline
+
+app = Flask(__name__)
+CORS(app)
+
+# ---------------- CONFIG ----------------
+app.config["REVIEWS_FILE"] = "Software.jsonl"
+app.config["META_FILE"] = "meta_Software.jsonl"
+app.config["MAX_ROWS"] = 5000
+app.config["RL_TIMESTEPS"] = 5000
+
+# ---------------- INIT PIPELINE ----------------
+print("🚀 Starting Trust Pipeline... (this may take time)")
+pipeline = TrustPipeline(app.config)
+pipeline.run()
+rec = pipeline.rec
+print("✅ Pipeline Ready!")
+
+# ---------------- AUTH (DUMMY) ----------------
+@app.route('/api/auth/login', methods=['POST'])
+def login():
+    return jsonify({"token": "dummy-token", "user": {"id": 1, "username": "testuser"}})
+
+# ---------------- PRODUCTS ----------------
+@app.route('/api/items/', methods=['GET'])
+def get_products():
+    search = request.args.get("search", "")
+    category = request.args.get("category", "")
+
+    try:
+        df = rec.df_products.copy()
+
+        # normalize
+        df["title"] = df.get("title", "").fillna("")
+        df["category"] = df.get("main_category", "Other")
+
+        if search:
+            df = df[df["title"].str.contains(search, case=False, na=False)]
+
+        if category:
+            df = df[df["category"] == category]
+
+        data = df.head(100).to_dict(orient="records")
+        return jsonify(data)
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
-def create_app():
-    app = Flask(__name__)
-    app.config.from_object(Config)
-
-    CORS(app, resources={r"/api/*": {"origins": "*"}})
-    db.init_app(app)
-    jwt.init_app(app)
-
-    from routes.auth import auth_bp
-    from routes.items import items_bp
-    from routes.recommendations import rec_bp
-    from routes.ratings import ratings_bp
-    from routes.analytics import analytics_bp
-
-    app.register_blueprint(auth_bp,      url_prefix='/api/auth')
-    app.register_blueprint(items_bp,     url_prefix='/api/items')
-    app.register_blueprint(rec_bp,       url_prefix='/api/recommendations')
-    app.register_blueprint(ratings_bp,   url_prefix='/api/ratings')
-    app.register_blueprint(analytics_bp, url_prefix='/api/analytics')
-
-    with app.app_context():
-        db.create_all()
-        from seed import seed_data
-        seed_data(db)
-
-    return app
+@app.route('/api/items/<asin>', methods=['GET'])
+def get_product(asin):
+    try:
+        product = rec.check_product(asin)
+        return jsonify(product)
+    except:
+        return jsonify({"error": "Not found"}), 404
 
 
-if __name__ == '__main__':
-    app = create_app()
-    app.run(debug=True, port=5000)
+# ---------------- RECOMMENDATIONS ----------------
+
+# ✅ SIMILAR PRODUCTS (REAL RL / TRUST)
+@app.route('/api/recommendations/similar/<asin>', methods=['GET'])
+def similar_products(asin):
+    try:
+        data = rec.similar_products(asin)
+        return jsonify(data)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ✅ TOP TRUSTED
+@app.route('/api/recommendations/for-you', methods=['GET'])
+def for_you():
+    try:
+        data = rec.top_trusted(10)
+        return jsonify(data)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ✅ TRUST CHECK
+@app.route('/api/recommendations/trust-check/<asin>', methods=['GET'])
+def trust_check(asin):
+    try:
+        data = rec.check_product(asin)
+        return jsonify(data)
+    except:
+        return jsonify({"error": "Not found"}), 404
+
+
+# ---------------- ANALYTICS ----------------
+@app.route('/api/analytics/overview')
+def overview():
+    try:
+        return jsonify({
+            "total_products": len(rec.df_products),
+            "total_reviews": len(rec.df_reviews)
+        })
+    except:
+        return jsonify({"error": "failed"}), 500
+
+
+# ---------------- RUN ----------------
+if __name__ == "__main__":
+    app.run(debug=True, use_reloader=False)

@@ -1,113 +1,223 @@
-"""
-Recommendation engine — faithful port of RecommendationEngine from recommendation_engine.py.
-Uses SimilarityEngine + TrustEngine to produce trustworthy ranked recommendations.
-"""
-from engine.similarity_engine import SimilarityEngine
-from engine.trust_engine import TrustEngine
+# backend/engine/recommendation_system.py
+
+import numpy as np
+import pandas as pd
+from .similarity_engine import SimilarityEngine
 
 
-class RecommendationEngine:
-    """
-    Mirrors RecommendationEngine.get_similar_trustworthy_products and
-    explain_recommendation exactly.
-    """
+class RecommendationSystem:
 
-    def __init__(self):
-        self.sim_engine = SimilarityEngine()
-        self.trust_engine = TrustEngine()
+    def __init__(self, df_reviews, df_products, rl_env, rl_model=None):
+        self.df_reviews  = df_reviews
+        self.df_products = df_products
+        self.rl_env      = rl_env
+        self.rl_model    = rl_model
+        self.sim         = SimilarityEngine(df_reviews, df_products)
 
-    # ------------------------------------------------------------------
-    # MAIN ENTRY POINT (mirrors get_recommendations_with_info)
-    # ------------------------------------------------------------------
-    def get_recommendations(self, target_asin, all_ratings, all_products,
-                             trust_map, min_trust=0.4, top_n=10,
-                             collab_w=0.6, content_w=0.4):
-        """
-        target_asin   : str ASIN of the seed product
-        all_ratings   : list of {'user_id', 'product_asin', 'rating'} dicts
-        all_products  : list of product dicts with asin/title/category/price/features
-        trust_map     : dict  asin -> trust result dict (pre-computed or live)
-        min_trust     : float minimum final_trust_score to include in results
-        top_n         : int max results to return
-        Returns       : {'target_product', 'recommendations', 'total_found'}
-        """
-        target_info = next((p for p in all_products if p['asin'] == target_asin), None)
-        if not target_info:
-            return None
+    def _rl_threshold(self, asin: str) -> float:
+        if self.rl_model is None:
+            return 0.5
 
-        candidates = self.sim_engine.calculate_hybrid_similarity(
-            target_asin, all_ratings, all_products,
-            top_n=100, collab_w=collab_w, content_w=content_w
-        )
+        state = self.rl_env.get_product_state(asin)
+        if state is None:
+            return 0.5
 
-        results = []
-        for asin, similarity, method_breakdown in candidates:
-            trust_data = trust_map.get(asin)
-            if trust_data is None:
-                continue
-            if trust_data['final_trust_score'] < min_trust:
-                continue
+        try:
+            action, _ = self.rl_model.predict(state, deterministic=True)
+            return float(np.clip(action[0], 0.0, 1.0))
+        except Exception:
+            return 0.5
 
-            final_score = similarity * trust_data['final_trust_score']
-            product_info = next((p for p in all_products if p['asin'] == asin), None)
+    def _risk_label(self, score: float) -> str:
+        if score >= 0.70: return "trusted"
+        if score >= 0.50: return "moderate"
+        return "risky"
 
-            results.append({
-                'asin': asin,
-                'similarity': round(similarity, 4),
-                'trust_data': trust_data,
-                'final_score': round(final_score, 4),
-                'method_breakdown': method_breakdown,
-                'product_info': product_info,
-                'explanation': self.explain_recommendation(
-                    target_asin, asin, similarity, trust_data, method_breakdown
-                )
-            })
+    def _meta(self, asin: str) -> dict:
+        base = {"title": asin, "price": 0.0, "category": "Unknown",
+                "store": "Unknown", "review_count": 0, "avg_rating": 0.0, "features": []}
 
-        results.sort(key=lambda x: x['final_score'], reverse=True)
-        results = results[:top_n]
+        rev = self.df_reviews[self.df_reviews["asin"] == asin]
+        if not rev.empty:
+            base["review_count"] = int(len(rev))
+            base["avg_rating"]   = round(float(rev["rating"].mean()), 2) if "rating" in rev.columns else 0.0
 
-        target_trust = trust_map.get(target_asin, {})
+        if self.df_products.empty:
+            return base
+
+        row = self.df_products[self.df_products["asin"] == asin]
+        if row.empty:
+            return base
+
+        r = row.iloc[0]
+
+        for col in ("title", "productTitle", "name"):
+            if col in r.index and pd.notna(r[col]):
+                base["title"] = str(r[col])[:120]; break
+
+        base["price"]    = float(r.get("price", 0) or 0)
+        base["category"] = str(r.get("main_category", "Unknown"))
+
+        for col in ("store", "seller", "brand", "manufacturer"):
+            if col in r.index and pd.notna(r[col]):
+                base["store"] = str(r[col]); break
+
+        raw = r.get("features", [])
+        if isinstance(raw, list):
+            base["features"] = [str(f)[:120] for f in raw[:6] if str(f).strip()]
+
+        if "rating_number" in r.index and pd.notna(r["rating_number"]):
+            base["review_count"] = max(base["review_count"], int(r["rating_number"]))
+
+        if "average_rating" in r.index and pd.notna(r["average_rating"]):
+            base["avg_rating"] = round(float(r["average_rating"]), 2)
+
+        return base
+
+    def check_product(self, asin: str) -> dict:
+        state      = self.rl_env.get_product_state(asin)
+        trust_data = self.rl_env.get_product_trust_data(asin)
+
+        if state is None or trust_data is None:
+            return {"error": f"ASIN '{asin}' not found"}
+
+        threshold  = self._rl_threshold(asin)
+        final_sc   = trust_data["final_trust_score"]
+        decision   = final_sc > threshold
 
         return {
-            'target_product': target_info,
-            'target_trust': target_trust,
-            'recommendations': results,
-            'total_found': len(results)
+            "asin": asin,
+            "meta": self._meta(asin),
+            "trust_data": trust_data,
+            "threshold": round(threshold, 4),
+            "decision": decision,
+            "risk_label": self._risk_label(final_sc),
+            "rl_powered": self.rl_model is not None,
         }
 
-    # ------------------------------------------------------------------
-    # EXPLANATION  (mirrors explain_recommendation)
-    # ------------------------------------------------------------------
-    def explain_recommendation(self, target_asin, rec_asin, similarity,
-                                trust_data, method_breakdown):
-        """
-        Returns human-readable explanation string, same structure as original.
-        """
-        parts = []
-        cs = method_breakdown.get('collaborative', 0.0)
-        co = method_breakdown.get('content', 0.0)
+    def similar_products(self, target_asin: str, top_n: int = 5, min_trust: float = 0.45):
 
-        parts.append(f"Overall similarity: {similarity:.1%}")
+        if target_asin not in self.rl_env.product_asins:
+            return None
 
-        if cs > 0:
-            parts.append(f"  • {cs:.1%} based on user co-review patterns "
-                         f"(users who rated {target_asin} also rated this)")
-        if co > 0:
-            parts.append(f"  • {co:.1%} based on product features "
-                         f"(category, title, price, features)")
+        candidates = self.sim.hybrid(target_asin, top_n=100)
+        results    = []
 
-        parts.append(f"Trust score: {trust_data['final_trust_score']:.3f}")
-        parts.append(f"  • Product trust: {trust_data['product_trust']:.3f}")
-        parts.append(f"  • Seller trust:  {trust_data['seller_trust']:.3f}")
+        for asin, sim_score, breakdown in candidates:
+            trust_data = self.rl_env.get_product_trust_data(asin)
+            if trust_data is None:
+                continue
 
-        details = trust_data.get('details', {})
-        if details:
-            parts.append(f"  • Verified purchase ratio: "
-                         f"{details.get('verified_ratio', 0):.1%}")
-            parts.append(f"  • Review confidence:       "
-                         f"{details.get('review_confidence', 0):.3f}")
+            threshold = self._rl_threshold(asin)
+            final_sc  = trust_data["final_trust_score"]
 
-        return '\n'.join(parts)
+            # ✅ FIXED CONDITION (RELAXED)
+            if final_sc >= min_trust or final_sc > threshold:
+                results.append({
+                    "asin": asin,
+                    "meta": self._meta(asin),
+                    "trust_data": trust_data,
+                    "similarity": round(sim_score, 4),
+                    "method_breakdown": breakdown,
+                    "final_score": round(sim_score * final_sc, 4),
+                    "risk_label": self._risk_label(final_sc),
+                    "rl_threshold": round(threshold, 4),
+                })
 
-    def invalidate_cache(self, asin=None):
-        self.sim_engine.invalidate_cache(asin)
+        results.sort(key=lambda x: x["final_score"], reverse=True)
+
+        target_trust = self.rl_env.get_product_trust_data(target_asin)
+        target_meta  = self._meta(target_asin)
+
+        # 🔥 FALLBACK
+        if len(results) == 0:
+            print("[WARN] No RL recommendations — using fallback")
+
+            fallback = []
+            for asin in self.rl_env.product_asins[:top_n]:
+                trust_data = self.rl_env.get_product_trust_data(asin)
+                if trust_data is None:
+                    continue
+
+                fallback.append({
+                    "asin": asin,
+                    "meta": self._meta(asin),
+                    "trust_data": trust_data,
+                    "similarity": 0,
+                    "method_breakdown": {},
+                    "final_score": trust_data["final_trust_score"],
+                    "risk_label": self._risk_label(trust_data["final_trust_score"]),
+                    "rl_threshold": 0.5,
+                })
+
+            return {
+                "target_asin": target_asin,
+                "target_product": target_meta,
+                "target_trust": target_trust,
+                "recommendations": fallback,
+                "total_found": len(fallback),
+            }
+
+        return {
+            "target_asin": target_asin,
+            "target_product": target_meta,
+            "target_trust": target_trust,
+            "recommendations": results[:top_n],
+            "total_found": len(results),
+        }
+
+    def random_products(self, n: int = 12):
+        chosen = np.random.choice(
+            self.rl_env.product_asins,
+            size=min(n, len(self.rl_env.product_asins)),
+            replace=False,
+        )
+        return [self.check_product(str(a)) for a in chosen]
+
+    def search_products(self, query: str, top_n: int = 20):
+        if self.df_products.empty:
+            return []
+
+        title_col = next(
+            (c for c in ("title", "productTitle", "name") if c in self.df_products.columns), None
+        )
+
+        if not title_col:
+            return []
+
+        mask = self.df_products[title_col].fillna("").str.contains(query, case=False, na=False)
+
+        results = []
+        for _, row in self.df_products[mask].head(top_n).iterrows():
+            asin = str(row.get("asin", ""))
+            results.append(self.check_product(asin) if asin else {"error": "no asin"})
+
+        return results
+
+    def top_trusted(self, n: int = 20, min_trust: float = 0.60):
+        cache = self.rl_env.trust_data_cache
+        asins = self.rl_env.product_asins
+
+        pairs = [
+            (str(asins[i]), cache[i])
+            for i in range(len(asins))
+            if cache[i]["final_trust_score"] >= min_trust
+        ]
+
+        pairs.sort(key=lambda x: x[1]["final_trust_score"], reverse=True)
+
+        results = []
+        for asin, td in pairs[:n]:
+            threshold = self._rl_threshold(asin)
+
+            results.append({
+                "asin": asin,
+                "meta": self._meta(asin),
+                "trust_data": td,
+                "threshold": round(threshold, 4),
+                "decision": td["final_trust_score"] > threshold,
+                "risk_label": self._risk_label(td["final_trust_score"]),
+                "rl_powered": self.rl_model is not None,
+            })
+
+        return results

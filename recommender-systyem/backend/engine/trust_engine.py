@@ -1,192 +1,199 @@
+# backend/engine/trust_engine.py
 """
-Trust scoring engine — faithful port of TrustworthyRecommender from trust_model.py.
-Works on the SQLAlchemy models instead of raw DataFrames so the web API can use it.
+Trust scoring engine.
+Computes product, user and seller trust scores from review + metadata DataFrames.
+This is a cleaned-up, self-contained copy of trust_model.py that lives inside
+the engine/ package so imports never need to go outside the package.
 """
-import math
-import statistics
 
-
-def _mean(arr):
-    return float(sum(arr) / len(arr)) if arr else 0.0
-
-
-def _std(arr):
-    if not arr or len(arr) < 2:
-        return 0.0
-    return float(statistics.pstdev(arr))
-
-
-def _median(arr):
-    return float(statistics.median(arr)) if arr else 0.0
-
-
-def _clip(value, min_val, max_val):
-    return float(max(min(value, max_val), min_val))
-
-
-def _nanmean(arr):
-    clean = [x for x in arr if x is not None and (not isinstance(x, float) or not math.isnan(x))]
-    return _mean(clean) if clean else 0.0
-
-
-def _jaccard_similarity(a, b):
-    a_tokens = set(str(a).lower().split())
-    b_tokens = set(str(b).lower().split())
-    if not a_tokens or not b_tokens:
-        return 0.0
-    intersection = a_tokens.intersection(b_tokens)
-    union = a_tokens.union(b_tokens)
-    return float(len(intersection) / len(union)) if union else 0.0
+import numpy as np
+import pandas as pd
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 
 
 class TrustEngine:
     """
-    Computes product_trust, user_trust, seller_trust and final_trust_score
-    exactly as defined in the original TrustworthyRecommender class.
+    Multi-dimensional trust scoring for products, users and sellers.
+
+    Weights (product trust):
+        avg_rating      35 %
+        review_volume   20 %
+        verified_ratio  15 %
+        price_normalcy  15 %
+        title_relevance 15 %
+
+    Final score:
+        product_trust  55 %
+        user_trust     35 %
+        seller_trust   10 %
     """
 
     def __init__(self):
-        pass
+        self.tfidf       = TfidfVectorizer(max_features=1000, stop_words="english")
+        self.mean_price  = None   # set by pipeline after loading data
+        self.title_col   = None   # e.g. "title"
+        self.seller_col  = None   # e.g. "store"
 
-    # ------------------------------------------------------------------
-    # USER TRUST  (mirrors user_trust_score)
-    # ------------------------------------------------------------------
-    def user_trust_score(self, ratings_qs):
-        """
-        ratings_qs : list of Rating ORM objects for one user
-        Returns float in [0, 1]
-        """
-        if not ratings_qs:
+    # ── user trust ────────────────────────────────────────────────────────────
+    def user_trust_score(self, df_reviews: pd.DataFrame, user_id) -> float:
+        uid_col = (
+            "user_id"    if "user_id"    in df_reviews.columns else
+            "reviewerID" if "reviewerID" in df_reviews.columns else None
+        )
+        if not uid_col:
             return 0.5
 
-        verified_flags = [bool(r.verified_purchase) for r in ratings_qs]
-        v_ratio = sum(verified_flags) / len(verified_flags)
+        ur = df_reviews[df_reviews[uid_col] == user_id]
+        if ur.empty:
+            return 0.5
 
-        helpful = [float(r.helpful_votes or 0) for r in ratings_qs]
-        h_mean = _mean(helpful)
-        h_ratio = h_mean / max(h_mean + 1.0, 1.0)
+        v_ratio = ur["verified_purchase"].mean() if "verified_purchase" in ur.columns else 0.5
 
-        raw_ratings = [float(r.rating or 0.0) for r in ratings_qs]
-        rating_std = _std(raw_ratings)
-        c_rating = 1.0 - (rating_std / 2.0)
+        h_col = next((c for c in ("helpful_vote", "vote") if c in ur.columns), None)
+        if h_col:
+            h = pd.to_numeric(ur[h_col], errors="coerce").fillna(0)
+            h_ratio = h.mean() / max((h + 1).mean(), 1)
+        else:
+            h_ratio = 0.0
 
-        text_lens = [len(str(r.review_text or '')) for r in ratings_qs]
-        median_len = _median(text_lens) if text_lens else 1.0
-        mean_len = _mean(text_lens) if text_lens else 0.0
-        q_text = _clip(mean_len / max(median_len, 10.0), 0.0, 1.0)
+        r_col = next((c for c in ("rating", "overall") if c in ur.columns), None)
+        if r_col:
+            ratings    = pd.to_numeric(ur[r_col], errors="coerce")
+            rating_std = ratings.std()
+            c_rating   = 1 - (rating_std / 2.0) if pd.notna(rating_std) else 1.0
+        else:
+            c_rating = 1.0
+
+        text_len = ur.get("text", pd.Series(dtype=str)).fillna("").str.len()
+        q_text   = float(np.clip(text_len.mean() / max(float(text_len.median()), 10), 0, 1))
 
         score = 0.30 * v_ratio + 0.25 * h_ratio + 0.20 * c_rating + 0.25 * q_text
-        return _clip(score, 0.0, 1.0)
+        return float(np.clip(score, 0.0, 1.0))
 
-    # ------------------------------------------------------------------
-    # PRODUCT TRUST  (mirrors product_trust_score with return_details=True)
-    # ------------------------------------------------------------------
-    def product_trust_score(self, product, ratings_qs, mean_price=None):
-        """
-        product     : Product ORM object
-        ratings_qs  : list of Rating ORM objects for this product
-        mean_price  : float, dataset-level mean price (optional)
-        Returns dict with product_trust + intermediate features
-        """
-        if not ratings_qs:
-            return {
-                'product_trust': 0.0,
-                'avg_rating_norm': 0.0,
-                'verified_ratio': 0.0,
-                'review_confidence': 0.0,
-                'text_quality': 0.0,
-                'price_factor': 1.0,
-                'title_similarity': 0.0,
+    # ── product trust ─────────────────────────────────────────────────────────
+    def product_trust_score(
+        self,
+        df_reviews: pd.DataFrame,
+        df_products: pd.DataFrame,
+        asin: str,
+        return_details: bool = False,
+    ):
+        pr = df_reviews[df_reviews["asin"] == asin]
+        if pr.empty:
+            empty = {
+                "product_trust":    0.0,
+                "avg_rating_norm":  0.0,
+                "verified_ratio":   0.0,
+                "review_confidence":0.0,
+                "text_quality":     0.0,
+                "price_factor":     1.0,
+                "title_similarity": 0.0,
             }
+            return empty if return_details else 0.0
 
-        raw_ratings = [float(r.rating or 0.0) for r in ratings_qs]
-        avg_rating = _mean(raw_ratings)
-        n = len(ratings_qs)
+        r_col = next((c for c in ("rating", "overall") if c in pr.columns), None)
+        ratings    = pd.to_numeric(pr[r_col], errors="coerce") if r_col else pd.Series([5.0] * len(pr))
+        avg_rating = float(ratings.mean())
+        rn_conf    = float(1 - np.exp(-len(pr) / 1000))
 
-        verified_flags = [bool(r.verified_purchase) for r in ratings_qs]
-        v_share = sum(verified_flags) / n
+        v_share     = float(pr["verified_purchase"].mean()) if "verified_purchase" in pr.columns else 0.0
+        text_quality = float(np.clip(pr["text"].fillna("").str.len().mean() / 500, 0, 1)) if "text" in pr.columns else 0.0
 
-        rn_conf = 1.0 - math.exp(-n / 1000.0)
-
-        text_lens = [len(str(r.review_text or '')) for r in ratings_qs]
-        text_quality = _clip(_mean(text_lens) / 500.0, 0.0, 1.0)
-
-        # Price abnormality
+        # price normalcy
         price_factor = 1.0
         try:
-            if mean_price and product.price and product.price > 0.0:
-                diff = abs(product.price - mean_price) / float(mean_price)
-                price_factor = 1.0 - min(diff, 1.0)
+            if self.mean_price and not df_products.empty:
+                row = df_products[df_products["asin"] == asin]
+                if not row.empty:
+                    price = float(pd.to_numeric(row["price"].iloc[0], errors="coerce"))
+                    if not np.isnan(self.mean_price) and self.mean_price > 0:
+                        price_factor = float(1.0 - min(abs(price - self.mean_price) / self.mean_price, 1.0))
         except Exception:
             price_factor = 1.0
 
-        # Title ↔ review text similarity fallback (no sklearn)
+        # title-review cosine similarity
         title_sim = 0.0
         try:
-            title = str(product.title or '')
-            reviews = [str(r.review_text or '') for r in ratings_qs if r.review_text]
-            if title and reviews:
-                scores = [_jaccard_similarity(title, text) for text in reviews]
-                title_sim = _mean(scores)
+            if self.title_col and self.title_col in df_products.columns:
+                row = df_products[df_products["asin"] == asin]
+                if not row.empty:
+                    title = str(row[self.title_col].iloc[0])
+                    texts = [title] + pr["text"].fillna("").astype(str).tolist()
+                    if len(texts) > 1 and any(t.strip() for t in texts[1:]):
+                        mat      = self.tfidf.fit_transform(texts)
+                        title_sim = float(cosine_similarity(mat[0:1], mat[1:]).mean())
         except Exception:
             title_sim = 0.0
 
-        p_trust = (
+        p_trust = float(np.clip(
             0.35 * (avg_rating / 5.0) +
             0.20 * rn_conf +
             0.15 * v_share +
             0.15 * price_factor +
-            0.15 * title_sim
-        )
-        p_trust = _clip(p_trust, 0.0, 1.0)
+            0.15 * title_sim,
+            0, 1,
+        ))
 
-        return {
-            'product_trust': p_trust,
-            'avg_rating_norm': avg_rating / 5.0,
-            'verified_ratio': v_share,
-            'review_confidence': rn_conf,
-            'text_quality': text_quality,
-            'price_factor': price_factor,
-            'title_similarity': title_sim,
-        }
+        if return_details:
+            return {
+                "product_trust":    p_trust,
+                "avg_rating_norm":  avg_rating / 5.0,
+                "verified_ratio":   v_share,
+                "review_confidence":rn_conf,
+                "text_quality":     text_quality,
+                "price_factor":     price_factor,
+                "title_similarity": title_sim,
+            }
+        return p_trust
 
-    # ------------------------------------------------------------------
-    # SELLER TRUST  (mirrors seller_trust_score)
-    # ------------------------------------------------------------------
-    def seller_trust_score(self, category_products_ratings, mean_price=None):
-        """
-        category_products_ratings : list of (Product, [Rating, ...]) for
-                                    all products in the same category/seller
-        """
-        if not category_products_ratings:
+    # ── seller trust ──────────────────────────────────────────────────────────
+    def seller_trust_score(
+        self,
+        df_reviews: pd.DataFrame,
+        df_products: pd.DataFrame,
+        asin: str,
+    ) -> float:
+        try:
+            if not self.seller_col or self.seller_col not in df_products.columns:
+                return 0.5
+            row = df_products[df_products["asin"] == asin]
+            if row.empty:
+                return 0.5
+            seller_id       = row[self.seller_col].iloc[0]
+            seller_products = df_products[df_products[self.seller_col] == seller_id]["asin"].unique()
+            scores = [
+                self.product_trust_score(df_reviews, df_products, a)
+                for a in seller_products
+            ]
+            return float(np.nanmean(scores)) if scores else 0.5
+        except Exception:
             return 0.5
-        scores = []
-        for prod, ratings in category_products_ratings:
-            d = self.product_trust_score(prod, ratings, mean_price)
-            scores.append(d['product_trust'])
-        return _mean(scores) if scores else 0.5
 
-    # ------------------------------------------------------------------
-    # FINAL COMBINED SCORE  (mirrors final_product_score)
-    # ------------------------------------------------------------------
-    def final_product_score(self, product, ratings_qs, user_ratings_qs=None,
-                             seller_products_ratings=None, mean_price=None):
-        """
-        Returns dict: product_trust, user_trust, seller_trust, final_trust_score, details
-        Weights: 0.55 * product + 0.35 * user + 0.10 * seller  (same as original)
-        """
-        p_details = self.product_trust_score(product, ratings_qs, mean_price)
-        p_trust = p_details['product_trust']
+    # ── combined final score ──────────────────────────────────────────────────
+    def final_product_score(
+        self,
+        df_reviews: pd.DataFrame,
+        df_products: pd.DataFrame,
+        asin: str,
+        user_id=None,
+        include_details: bool = False,
+    ) -> dict:
+        details_raw = self.product_trust_score(df_reviews, df_products, asin, return_details=True)
+        p_trust     = details_raw["product_trust"]
+        s_trust     = self.seller_trust_score(df_reviews, df_products, asin)
+        u_trust     = self.user_trust_score(df_reviews, user_id) if user_id else 0.5
 
-        u_trust = self.user_trust_score(user_ratings_qs) if user_ratings_qs else 0.5
-        s_trust = self.seller_trust_score(seller_products_ratings or [], mean_price)
+        final = round(0.55 * p_trust + 0.35 * u_trust + 0.10 * s_trust, 3)
 
-        final = 0.55 * p_trust + 0.35 * u_trust + 0.10 * s_trust
-
-        return {
-            'product_trust': round(p_trust, 3),
-            'user_trust': round(u_trust, 3),
-            'seller_trust': round(s_trust, 3),
-            'final_trust_score': round(float(final), 3),
-            'details': {k: round(v, 3) for k, v in p_details.items() if k != 'product_trust'}
+        result = {
+            "asin":              asin,
+            "product_trust":     round(p_trust, 3),
+            "user_trust":        round(u_trust, 3),
+            "seller_trust":      round(s_trust, 3),
+            "final_trust_score": final,
         }
+        if include_details:
+            result["details"] = {k: round(float(v), 3) for k, v in details_raw.items() if k != "product_trust"}
+
+        return result

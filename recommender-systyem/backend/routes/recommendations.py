@@ -1,253 +1,275 @@
-from flask import Blueprint, request, jsonify
-from flask_jwt_extended import jwt_required, get_jwt_identity, verify_jwt_in_request
+"""
+routes/recommendations.py
+Flask Blueprint that exposes the recommendation + trust engine via REST API.
+
+Endpoints
+---------
+GET  /api/recommendations/<asin>          — get top-N similar trustworthy products
+GET  /api/trust/<asin>                    — get trust breakdown for one product
+GET  /api/products                        — list all products (paginated)
+POST /api/recommendations/batch           — trust-check a list of ASINs
+
+All heavy logic lives in engine/; this file only handles HTTP + ORM queries.
+"""
+from flask import Blueprint, jsonify, request, current_app
+from extensions import db
 from models import Product, Rating
+
 from engine.recommendation_system import RecommendationEngine
+from engine.trust_engine import TrustEngine
 
-rec_bp = Blueprint('recommendations', __name__)
-_engine = RecommendationEngine()
+recommendations_bp = Blueprint('recommendations', __name__)
+
+# Module-level singletons (created once per worker process)
+_rec_engine   = RecommendationEngine()
+_trust_engine = TrustEngine()
 
 
-def _build_data_structures():
-    """Build the flat lists needed by the engine from the DB."""
-    all_products = []
-    for p in Product.query.all():
-        import json
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+def _product_to_dict(p: Product) -> dict:
+    """Convert a Product ORM object to the dict format the engine expects."""
+    features = []
+    if p.features:
         try:
-            features = json.loads(p.features) if p.features else []
+            import json
+            features = json.loads(p.features) if isinstance(p.features, str) else p.features
         except Exception:
             features = []
-        all_products.append({
-            'asin': p.asin, 'title': p.title, 'category': p.category,
-            'price': p.price, 'features': features,
-            'avg_rating': p.avg_rating, 'rating_count': p.rating_count
-        })
+    return {
+        'asin':     p.asin,
+        'title':    p.title     or '',
+        'category': p.category  or '',
+        'price':    float(p.price or 0.0),
+        'features': features,
+    }
 
-    all_ratings = []
-    for r in Rating.query.all():
-        p = Product.query.get(r.product_id)
-        if p:
-            all_ratings.append({
-                'user_id': r.user_id,
-                'product_asin': p.asin,
-                'rating': r.rating
-            })
 
+def _rating_to_dict(r: Rating) -> dict:
+    """Convert a Rating ORM object to the dict format the engine expects."""
+    return {
+        'user_id':      r.user_id,
+        'product_asin': r.product_asin,
+        'rating':       float(r.rating or 0.0),
+    }
+
+
+def _build_trust_map(product_asins: list, mean_price: float = None) -> dict:
+    """
+    Pre-compute trust scores for a list of ASINs.
+    Returns dict: asin -> trust result dict.
+    Mirrors the pipeline's Step 5 trust loop.
+    """
     trust_map = {}
-    for p in Product.query.all():
-        trust_map[p.asin] = {
-            'product_trust': p.product_trust,
-            'user_trust': 0.5,
-            'seller_trust': p.seller_trust,
-            'final_trust_score': p.final_trust_score,
-            'details': {
-                'avg_rating_norm': p.avg_rating_norm,
-                'verified_ratio': p.verified_ratio,
-                'review_confidence': p.review_confidence,
-                'text_quality': p.text_quality,
-                'price_factor': p.price_factor,
-                'title_similarity': p.title_similarity,
-            }
-        }
-    return all_products, all_ratings, trust_map
+    for asin in product_asins:
+        product = Product.query.filter_by(asin=asin).first()
+        if not product:
+            continue
+        ratings_qs = Rating.query.filter_by(product_asin=asin).all()
+
+        # User trust: use the first reviewer as representative sample
+        user_ratings_qs = None
+        if ratings_qs:
+            sample_user     = ratings_qs[0].user_id
+            user_ratings_qs = Rating.query.filter_by(user_id=sample_user).all()
+
+        # Seller trust: all products in same category
+        seller_products_ratings = []
+        if product.category:
+            peer_products = Product.query.filter_by(category=product.category).limit(50).all()
+            for peer in peer_products:
+                peer_ratings = Rating.query.filter_by(product_asin=peer.asin).all()
+                seller_products_ratings.append((peer, peer_ratings))
+
+        trust_map[asin] = _trust_engine.final_product_score(
+            product,
+            ratings_qs,
+            user_ratings_qs=user_ratings_qs,
+            seller_products_ratings=seller_products_ratings,
+            mean_price=mean_price,
+        )
+    return trust_map
 
 
-@rec_bp.route('/similar/<string:asin>', methods=['GET'])
-def similar_products(asin):
+def _get_mean_price() -> float:
+    """Dataset-level mean price (cached on app context to avoid recompute)."""
+    if not hasattr(current_app, '_mean_price_cache'):
+        from sqlalchemy import func
+        result = db.session.query(func.avg(Product.price)).scalar()
+        current_app._mean_price_cache = float(result) if result else None
+    return current_app._mean_price_cache
+
+
+# ── ROUTES ────────────────────────────────────────────────────────────────────
+
+@recommendations_bp.route('/api/recommendations/<string:asin>', methods=['GET'])
+def get_recommendations(asin: str):
     """
-    GET /api/recommendations/similar/<asin>
-    Returns hybrid (collaborative + content) trustworthy recommendations.
-    Mirrors RecommendationEngine.get_recommendations_with_info.
+    GET /api/recommendations/<asin>?min_trust=0.4&top_n=10&collab_w=0.6&content_w=0.4
+
+    Returns top-N similar trustworthy products for the given seed ASIN.
     """
-    min_trust = float(request.args.get('min_trust', 0.4))
-    top_n = int(request.args.get('top_n', 10))
-    collab_w = float(request.args.get('collab_w', 0.6))
-    content_w = float(request.args.get('content_w', 0.4))
+    min_trust = float(request.args.get('min_trust',  0.4))
+    top_n     = int(  request.args.get('top_n',      10))
+    collab_w  = float(request.args.get('collab_w',   0.6))
+    content_w = float(request.args.get('content_w',  0.4))
 
-    all_products, all_ratings, trust_map = _build_data_structures()
-
-    result = _engine.get_recommendations(
-        asin, all_ratings, all_products, trust_map,
-        min_trust=min_trust, top_n=top_n,
-        collab_w=collab_w, content_w=content_w
-    )
-    if result is None:
+    # Validate seed product
+    target_product = Product.query.filter_by(asin=asin).first()
+    if not target_product:
         return jsonify({'error': f'Product {asin} not found'}), 404
 
-    # Enrich recommendations with DB product data
-    enriched_recs = []
-    for rec in result['recommendations']:
-        p = Product.query.filter_by(asin=rec['asin']).first()
-        if p:
-            enriched_recs.append({
-                'product': p.to_dict(),
-                'similarity': rec['similarity'],
-                'final_score': rec['final_score'],
-                'method_breakdown': rec['method_breakdown'],
-                'explanation': rec['explanation']
-            })
+    mean_price = _get_mean_price()
 
-    target_p = Product.query.filter_by(asin=asin).first()
-    return jsonify({
-        'target_product': target_p.to_dict() if target_p else result['target_product'],
-        'target_trust': result['target_trust'],
-        'recommendations': enriched_recs,
-        'total_found': len(enriched_recs),
-        'algorithm_config': {'collab_weight': collab_w, 'content_weight': content_w, 'min_trust': min_trust}
-    })
+    # Load all products + ratings as plain dicts for the engine
+    all_products = [_product_to_dict(p) for p in Product.query.all()]
+    all_ratings  = [_rating_to_dict(r)  for r in Rating.query.all()]
+
+    # Build trust map for all candidate ASINs
+    all_asins = [p['asin'] for p in all_products]
+    trust_map = _build_trust_map(all_asins, mean_price)
+
+    result = _rec_engine.get_recommendations(
+        target_asin  = asin,
+        all_ratings  = all_ratings,
+        all_products = all_products,
+        trust_map    = trust_map,
+        min_trust    = min_trust,
+        top_n        = top_n,
+        collab_w     = collab_w,
+        content_w    = content_w,
+    )
+
+    if result is None:
+        return jsonify({'error': f'Could not generate recommendations for {asin}'}), 404
+
+    return jsonify(result)
 
 
-@rec_bp.route('/for-you', methods=['GET'])
-@jwt_required()
-def for_you():
+@recommendations_bp.route('/api/trust/<string:asin>', methods=['GET'])
+def get_trust(asin: str):
     """
-    Personalised recommendations for the logged-in user.
-    Uses the user's highest-rated product as seed, then applies hybrid filtering.
-    """
-    user_id = int(get_jwt_identity())
-    top_n = int(request.args.get('top_n', 10))
-    min_trust = float(request.args.get('min_trust', 0.4))
+    GET /api/trust/<asin>
 
-    # Find user's best-rated product as seed
-    user_ratings = (Rating.query
-                    .filter_by(user_id=user_id)
-                    .order_by(Rating.rating.desc())
-                    .limit(3).all())
-
-    if not user_ratings:
-        # Fall back to globally trusted products
-        products = (Product.query
-                    .filter(Product.final_trust_score >= min_trust)
-                    .order_by(Product.final_trust_score.desc())
-                    .limit(top_n).all())
-        return jsonify({
-            'recommendations': [{'product': p.to_dict(), 'final_score': p.final_trust_score,
-                                  'similarity': 1.0, 'method_breakdown': {'collaborative': 0, 'content': 0},
-                                  'explanation': 'Top trusted product in our catalogue'} for p in products],
-            'seed_asin': None,
-            'total_found': len(products)
-        })
-
-    all_products, all_ratings, trust_map = _build_data_structures()
-
-    # Aggregate recommendations from top 3 rated products
-    seen_asins = {Product.query.get(r.product_id).asin for r in user_ratings if Product.query.get(r.product_id)}
-    aggregated = {}
-
-    for ur in user_ratings:
-        seed_p = Product.query.get(ur.product_id)
-        if not seed_p:
-            continue
-        result = _engine.get_recommendations(
-            seed_p.asin, all_ratings, all_products, trust_map,
-            min_trust=min_trust, top_n=top_n * 2
-        )
-        if result:
-            for rec in result['recommendations']:
-                a = rec['asin']
-                if a not in seen_asins:
-                    if a not in aggregated or rec['final_score'] > aggregated[a]['final_score']:
-                        aggregated[a] = rec
-
-    final = sorted(aggregated.values(), key=lambda x: x['final_score'], reverse=True)[:top_n]
-
-    enriched = []
-    for rec in final:
-        p = Product.query.filter_by(asin=rec['asin']).first()
-        if p:
-            enriched.append({
-                'product': p.to_dict(),
-                'similarity': rec['similarity'],
-                'final_score': rec['final_score'],
-                'method_breakdown': rec['method_breakdown'],
-                'explanation': rec['explanation']
-            })
-
-    seed_asin = Product.query.get(user_ratings[0].product_id).asin if user_ratings else None
-    return jsonify({
-        'recommendations': enriched,
-        'seed_asin': seed_asin,
-        'total_found': len(enriched)
-    })
-
-
-@rec_bp.route('/trust-check/<string:asin>', methods=['GET'])
-def trust_check(asin):
-    """
     Returns full trust breakdown for a single product.
-    Mirrors display_product_recommendation from recommendation_display.py.
     """
-    p = Product.query.filter_by(asin=asin).first_or_404()
-    threshold = float(request.args.get('threshold', 0.5))
-    trust_score = p.final_trust_score
-    is_trustworthy = trust_score > threshold
+    product = Product.query.filter_by(asin=asin).first()
+    if not product:
+        return jsonify({'error': f'Product {asin} not found'}), 404
+
+    ratings_qs = Rating.query.filter_by(product_asin=asin).all()
+
+    user_ratings_qs = None
+    if ratings_qs:
+        sample_user     = ratings_qs[0].user_id
+        user_ratings_qs = Rating.query.filter_by(user_id=sample_user).all()
+
+    seller_products_ratings = []
+    if product.category:
+        peer_products = Product.query.filter_by(category=product.category).limit(50).all()
+        for peer in peer_products:
+            peer_ratings = Rating.query.filter_by(product_asin=peer.asin).all()
+            seller_products_ratings.append((peer, peer_ratings))
+
+    mean_price = _get_mean_price()
+
+    trust_data = _trust_engine.final_product_score(
+        product,
+        ratings_qs,
+        user_ratings_qs=user_ratings_qs,
+        seller_products_ratings=seller_products_ratings,
+        mean_price=mean_price,
+    )
+    trust_data['asin'] = asin
+    return jsonify(trust_data)
+
+
+@recommendations_bp.route('/api/products', methods=['GET'])
+def list_products():
+    """
+    GET /api/products?page=1&per_page=20
+
+    Returns a paginated list of products with their trust scores.
+    """
+    page     = int(request.args.get('page',     1))
+    per_page = int(request.args.get('per_page', 20))
+
+    paginated = Product.query.paginate(page=page, per_page=per_page, error_out=False)
+    mean_price = _get_mean_price()
+
+    items = []
+    for product in paginated.items:
+        ratings_qs = Rating.query.filter_by(product_asin=product.asin).all()
+        trust_data = _trust_engine.final_product_score(
+            product, ratings_qs, mean_price=mean_price
+        )
+        items.append({
+            **_product_to_dict(product),
+            'trust': trust_data,
+        })
 
     return jsonify({
-        'asin': asin,
-        'product': p.to_dict(),
-        'trust_breakdown': {
-            'product_trust': p.product_trust,
-            'seller_trust': p.seller_trust,
-            'final_trust_score': p.final_trust_score,
-            'details': {
-                'avg_rating_norm': p.avg_rating_norm,
-                'verified_ratio': p.verified_ratio,
-                'review_confidence': p.review_confidence,
-                'text_quality': p.text_quality,
-                'price_factor': p.price_factor,
-                'title_similarity': p.title_similarity,
-            }
-        },
-        'rl_decision': {
-            'threshold': threshold,
-            'is_trustworthy': is_trustworthy,
-            'verdict': 'TRUSTWORTHY' if is_trustworthy else 'RISKY',
-            'reason': (
-                f"Trust score ({trust_score:.3f}) {'exceeds' if is_trustworthy else 'is below'} "
-                f"threshold ({threshold:.3f})"
-            )
-        }
+        'products':   items,
+        'total':      paginated.total,
+        'page':       page,
+        'per_page':   per_page,
+        'pages':      paginated.pages,
     })
 
 
-@rec_bp.route('/batch-check', methods=['POST'])
-def batch_check():
+@recommendations_bp.route('/api/recommendations/batch', methods=['POST'])
+def batch_trust_check():
     """
-    Mirrors display_batch_recommendations.
-    Body: { "asins": [...], "threshold": 0.5 }
-    """
-    data = request.get_json()
-    asins = data.get('asins', [])
-    threshold = float(data.get('threshold', 0.5))
+    POST /api/recommendations/batch
+    Body: {"asins": ["B001", "B002", ...], "threshold": 0.5}
 
-    results = []
+    Returns trust verdict for each ASIN — mirrors display_batch_recommendations().
+    """
+    body      = request.get_json(force=True) or {}
+    asins     = body.get('asins', [])
+    threshold = float(body.get('threshold', 0.5))
+
+    if not asins:
+        return jsonify({'error': 'No ASINs provided'}), 400
+
+    mean_price = _get_mean_price()
+    results    = []
+
     for asin in asins:
-        p = Product.query.filter_by(asin=asin).first()
-        if not p:
+        product = Product.query.filter_by(asin=asin).first()
+        if not product:
+            results.append({'asin': asin, 'error': 'Not found'})
             continue
-        is_trustworthy = p.final_trust_score > threshold
+
+        ratings_qs = Rating.query.filter_by(product_asin=asin).all()
+        trust_data = _trust_engine.final_product_score(
+            product, ratings_qs, mean_price=mean_price
+        )
+        decision = trust_data['final_trust_score'] >= threshold
+
         results.append({
-            'asin': asin,
-            'title': p.title,
-            'trust_data': {
-                'product_trust': p.product_trust,
-                'seller_trust': p.seller_trust,
-                'final_trust_score': p.final_trust_score,
-            },
-            'threshold': threshold,
-            'decision': is_trustworthy,
-            'verdict': 'TRUSTWORTHY' if is_trustworthy else 'RISKY'
+            'asin':       asin,
+            'trust_data': trust_data,
+            'threshold':  threshold,
+            'decision':   decision,
+            'verdict':    'TRUSTWORTHY' if decision else 'RISKY',
         })
 
-    trustworthy_count = sum(1 for r in results if r['decision'])
-    avg_trust = sum(r['trust_data']['final_trust_score'] for r in results) / len(results) if results else 0
+    # Summary stats (mirrors display_batch_recommendations)
+    decided   = [r for r in results if 'decision' in r]
+    n         = len(decided)
+    n_trust   = sum(1 for r in decided if r['decision'])
+    avg_trust = (
+        sum(r['trust_data']['final_trust_score'] for r in decided) / n
+        if n else 0.0
+    )
 
     return jsonify({
         'results': results,
         'summary': {
-            'total': len(results),
-            'trustworthy': trustworthy_count,
-            'risky': len(results) - trustworthy_count,
-            'avg_trust': round(avg_trust, 3),
-            'threshold': threshold
+            'total':            len(results),
+            'trustworthy':      n_trust,
+            'risky':            n - n_trust,
+            'avg_trust_score':  round(avg_trust, 3),
         }
     })
