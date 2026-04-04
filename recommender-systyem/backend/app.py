@@ -11,7 +11,7 @@ CORS(app)
 app.config["REVIEWS_FILE"] = "Software.jsonl"
 app.config["META_FILE"] = "meta_Software.jsonl"
 app.config["MAX_ROWS"] = 20000
-app.config["RL_TIMESTEPS"] = 5000
+app.config["RL_TIMESTEPS"] = 15000
 
 print("🚀 Starting Trust Pipeline... (this may take time)")
 pipeline = TrustPipeline(app.config)
