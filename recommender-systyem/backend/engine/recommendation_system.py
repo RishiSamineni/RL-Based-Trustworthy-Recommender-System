@@ -8,11 +8,11 @@ from .similarity_engine import SimilarityEngine
 class RecommendationSystem:
 
     def __init__(self, df_reviews, df_products, rl_env, rl_model=None):
-        self.df_reviews  = df_reviews
+        self.df_reviews = df_reviews
         self.df_products = df_products
-        self.rl_env      = rl_env
-        self.rl_model    = rl_model
-        self.sim         = SimilarityEngine(df_reviews, df_products)
+        self.rl_env = rl_env
+        self.rl_model = rl_model
+        self.sim = SimilarityEngine(df_reviews, df_products)
 
     def _rl_threshold(self, asin: str) -> float:
         if self.rl_model is None:
@@ -29,18 +29,28 @@ class RecommendationSystem:
             return 0.5
 
     def _risk_label(self, score: float) -> str:
-        if score >= 0.70: return "trusted"
-        if score >= 0.50: return "moderate"
+        if score >= 0.70:
+            return "trusted"
+        if score >= 0.50:
+            return "moderate"
         return "risky"
 
     def _meta(self, asin: str) -> dict:
-        base = {"title": asin, "price": 0.0, "category": "Unknown",
-                "store": "Unknown", "review_count": 0, "avg_rating": 0.0, "features": []}
+        base = {
+            "title": asin,
+            "price": 0.0,
+            "category": "Unknown",
+            "store": "Unknown",
+            "review_count": 0,
+            "avg_rating": 0.0,
+            "features": [],
+            "images": [],
+        }
 
         rev = self.df_reviews[self.df_reviews["asin"] == asin]
         if not rev.empty:
             base["review_count"] = int(len(rev))
-            base["avg_rating"]   = round(float(rev["rating"].mean()), 2) if "rating" in rev.columns else 0.0
+            base["avg_rating"] = round(float(rev["rating"].mean()), 2) if "rating" in rev.columns else 0.0
 
         if self.df_products.empty:
             return base
@@ -53,18 +63,24 @@ class RecommendationSystem:
 
         for col in ("title", "productTitle", "name"):
             if col in r.index and pd.notna(r[col]):
-                base["title"] = str(r[col])[:120]; break
+                base["title"] = str(r[col])[:120]
+                break
 
-        base["price"]    = float(r.get("price", 0) or 0)
+        base["price"] = float(r.get("price", 0) or 0)
         base["category"] = str(r.get("main_category", "Unknown"))
 
         for col in ("store", "seller", "brand", "manufacturer"):
             if col in r.index and pd.notna(r[col]):
-                base["store"] = str(r[col]); break
+                base["store"] = str(r[col])
+                break
 
         raw = r.get("features", [])
         if isinstance(raw, list):
             base["features"] = [str(f)[:120] for f in raw[:6] if str(f).strip()]
+
+        raw_images = r.get("images", [])
+        if isinstance(raw_images, list):
+            base["images"] = raw_images
 
         if "rating_number" in r.index and pd.notna(r["rating_number"]):
             base["review_count"] = max(base["review_count"], int(r["rating_number"]))
@@ -74,16 +90,33 @@ class RecommendationSystem:
 
         return base
 
-    def check_product(self, asin: str) -> dict:
-        state      = self.rl_env.get_product_state(asin)
-        trust_data = self.rl_env.get_product_trust_data(asin)
+    def _get_precomputed_trust(self, asin: str):
+        row = self.df_products[self.df_products["asin"] == asin]
+        if row.empty:
+            return None
 
-        if state is None or trust_data is None:
+        r = row.iloc[0]
+        final_score = r.get("final_trust_score", np.nan)
+
+        if pd.isna(final_score):
+            return None
+
+        return {
+            "asin": asin,
+            "product_trust": float(r.get("product_trust", 0.5) if pd.notna(r.get("product_trust", np.nan)) else 0.5),
+            "user_trust": float(r.get("user_trust", 0.5) if pd.notna(r.get("user_trust", np.nan)) else 0.5),
+            "seller_trust": float(r.get("seller_trust", 0.5) if pd.notna(r.get("seller_trust", np.nan)) else 0.5),
+            "final_trust_score": float(final_score),
+        }
+
+    def check_product(self, asin: str) -> dict:
+        trust_data = self._get_precomputed_trust(asin)
+        if trust_data is None:
             return {"error": f"ASIN '{asin}' not found"}
 
-        threshold  = self._rl_threshold(asin)
-        final_sc   = trust_data["final_trust_score"]
-        decision   = final_sc > threshold
+        threshold = self._rl_threshold(asin)
+        final_sc = trust_data["final_trust_score"]
+        decision = final_sc > threshold
 
         return {
             "asin": asin,
@@ -96,22 +129,21 @@ class RecommendationSystem:
         }
 
     def similar_products(self, target_asin: str, top_n: int = 5, min_trust: float = 0.45):
-
-        if target_asin not in self.rl_env.product_asins:
+        row = self.df_products[self.df_products["asin"] == target_asin]
+        if row.empty:
             return None
 
         candidates = self.sim.hybrid(target_asin, top_n=100)
-        results    = []
+        results = []
 
         for asin, sim_score, breakdown in candidates:
-            trust_data = self.rl_env.get_product_trust_data(asin)
+            trust_data = self._get_precomputed_trust(asin)
             if trust_data is None:
                 continue
 
             threshold = self._rl_threshold(asin)
-            final_sc  = trust_data["final_trust_score"]
+            final_sc = trust_data["final_trust_score"]
 
-            # ✅ FIXED CONDITION (RELAXED)
             if final_sc >= min_trust or final_sc > threshold:
                 results.append({
                     "asin": asin,
@@ -126,16 +158,17 @@ class RecommendationSystem:
 
         results.sort(key=lambda x: x["final_score"], reverse=True)
 
-        target_trust = self.rl_env.get_product_trust_data(target_asin)
-        target_meta  = self._meta(target_asin)
+        target_trust = self._get_precomputed_trust(target_asin)
+        target_meta = self._meta(target_asin)
 
-        # 🔥 FALLBACK
         if len(results) == 0:
-            print("[WARN] No RL recommendations — using fallback")
-
             fallback = []
-            for asin in self.rl_env.product_asins[:top_n]:
-                trust_data = self.rl_env.get_product_trust_data(asin)
+            trusted_df = self.df_products[self.df_products["final_trust_score"].notna()].copy()
+            trusted_df = trusted_df.sort_values("final_trust_score", ascending=False).head(top_n)
+
+            for _, r in trusted_df.iterrows():
+                asin = str(r["asin"])
+                trust_data = self._get_precomputed_trust(asin)
                 if trust_data is None:
                     continue
 
@@ -167,19 +200,20 @@ class RecommendationSystem:
         }
 
     def random_products(self, n: int = 12):
-        chosen = np.random.choice(
-            self.rl_env.product_asins,
-            size=min(n, len(self.rl_env.product_asins)),
-            replace=False,
-        )
-        return [self.check_product(str(a)) for a in chosen]
+        trusted_df = self.df_products[self.df_products["final_trust_score"].notna()].copy()
+        if trusted_df.empty:
+            return []
+
+        chosen = trusted_df.sample(n=min(n, len(trusted_df)), replace=False)["asin"].astype(str).tolist()
+        return [self.check_product(a) for a in chosen]
 
     def search_products(self, query: str, top_n: int = 20):
         if self.df_products.empty:
             return []
 
         title_col = next(
-            (c for c in ("title", "productTitle", "name") if c in self.df_products.columns), None
+            (c for c in ("title", "productTitle", "name") if c in self.df_products.columns),
+            None,
         )
 
         if not title_col:
@@ -195,21 +229,18 @@ class RecommendationSystem:
         return results
 
     def top_trusted(self, n: int = 20, min_trust: float = 0.60):
-        cache = self.rl_env.trust_data_cache
-        asins = self.rl_env.product_asins
-
-        pairs = [
-            (str(asins[i]), cache[i])
-            for i in range(len(asins))
-            if cache[i]["final_trust_score"] >= min_trust
-        ]
-
-        pairs.sort(key=lambda x: x[1]["final_trust_score"], reverse=True)
+        trusted_df = self.df_products[self.df_products["final_trust_score"].notna()].copy()
+        trusted_df = trusted_df[trusted_df["final_trust_score"] >= min_trust]
+        trusted_df = trusted_df.sort_values("final_trust_score", ascending=False)
 
         results = []
-        for asin, td in pairs[:n]:
-            threshold = self._rl_threshold(asin)
+        for _, row in trusted_df.head(n).iterrows():
+            asin = str(row["asin"])
+            td = self._get_precomputed_trust(asin)
+            if td is None:
+                continue
 
+            threshold = self._rl_threshold(asin)
             results.append({
                 "asin": asin,
                 "meta": self._meta(asin),
