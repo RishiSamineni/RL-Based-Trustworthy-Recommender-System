@@ -14,6 +14,7 @@ warnings.filterwarnings("ignore")
 from .trust_engine import TrustEngine
 from .rl_engine import TrustRLEnvironment, train_ppo, RL_AVAILABLE
 from .recommendation_system import RecommendationSystem
+from .evaluate_rl import evaluate_rl_model
 
 import re
 import nltk
@@ -119,6 +120,7 @@ class TrustPipeline:
         self.trust_eng = None
         self.rl_env = None
         self.rl_model = None
+        self.rl_eval = None
         self.rec = None
         self.is_ready = False
 
@@ -132,12 +134,14 @@ class TrustPipeline:
         self._clean_text()
         self._build_trust_engine()
         self._build_rl_env()
+
         if RL_AVAILABLE:
             self._train_rl()
+            self._evaluate_rl()
+        else:
+            self.rl_eval = None
 
-        # NEW: merge precomputed trust into df_products
         self._merge_precomputed_trust()
-
         self._build_rec_system()
 
         self.is_ready = True
@@ -145,7 +149,7 @@ class TrustPipeline:
         return self
 
     def _load(self):
-        print("[1/8] Loading data …")
+        print("[1/9] Loading data …")
         self.df_reviews = _load_jsonl(self.reviews_file, self.max_rows)
         self.df_products = _load_jsonl(self.meta_file, 500_000)
         if self.df_reviews.empty:
@@ -153,7 +157,7 @@ class TrustPipeline:
         print(f"reviews={len(self.df_reviews)} products={len(self.df_products)}")
 
     def _standardise(self):
-        print("[2/8] Standardising column names …")
+        print("[2/9] Standardising column names …")
         rename = {
             "reviewerID": "user_id",
             "overall": "rating",
@@ -183,7 +187,7 @@ class TrustPipeline:
             p["rating"] = pd.to_numeric(p["average_rating"], errors="coerce").fillna(0)
 
     def _fix_types(self):
-        print("[3/8] Fixing data types …")
+        print("[3/9] Fixing data types …")
         r = self.df_reviews
 
         r["rating"] = pd.to_numeric(r.get("rating", 5), errors="coerce").fillna(5)
@@ -192,14 +196,13 @@ class TrustPipeline:
         r["helpful_vote"] = pd.to_numeric(r.get("helpful_vote", 0), errors="coerce").fillna(0)
 
     def _clean_text(self):
-        print("[4/8] Cleaning text …")
+        print("[4/9] Cleaning text …")
         self.df_reviews["text"] = self.df_reviews["text"].apply(_clean_text)
 
     def _build_trust_engine(self):
-        print("[5/8] Trust engine …")
+        print("[5/9] Trust engine …")
         self.trust_eng = TrustEngine()
 
-        # important setup for trust_engine internals
         if not self.df_products.empty and "price" in self.df_products.columns:
             prices = pd.to_numeric(self.df_products["price"], errors="coerce")
             self.trust_eng.mean_price = float(prices.dropna().mean()) if not prices.dropna().empty else None
@@ -215,15 +218,23 @@ class TrustPipeline:
                 break
 
     def _build_rl_env(self):
-        print("[6/8] RL env …")
+        print("[6/9] RL env …")
         self.rl_env = TrustRLEnvironment(self.df_reviews, self.df_products, self.trust_eng)
 
     def _train_rl(self):
-        print("[7/8] Training RL …")
+        print("[7/9] Training RL …")
         self.rl_model = train_ppo(self.rl_env, self.rl_timesteps)
 
+    def _evaluate_rl(self):
+        print("[8/9] Evaluating RL model …")
+        self.rl_eval = evaluate_rl_model(
+            self.rl_env,
+            self.rl_model,
+            trusted_cutoff=0.50,
+        )
+
     def _merge_precomputed_trust(self):
-        print("[8/8] Merging precomputed trust into df_products …")
+        print("[9/9] Merging precomputed trust into df_products …")
 
         rows = []
         for asin, td in zip(self.rl_env.product_asins, self.rl_env.trust_data_cache):
