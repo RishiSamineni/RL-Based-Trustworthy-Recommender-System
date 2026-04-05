@@ -7,10 +7,11 @@ State S  : [final_trust, avg_rating_norm, verified_ratio,
 
 Action A : learned trust threshold ∈ [0.2, 0.75] (1-D continuous)
 Reward R : balanced objective that discourages:
-           - trivial threshold = 0 collapse
+           - trivial threshold collapse
            - overly high threshold collapse
            - accepting low-trust products
            - rejecting genuinely good products
+           - blindly trusting borderline products
 
 The PPO agent learns a per-product trust threshold dynamically.
 """
@@ -125,58 +126,80 @@ class TrustRLEnvironment(gym.Env if GYM_OK else object):
 
         recommend = true_trust >= threshold
 
-        # slightly relaxed target to avoid making the policy too strict
-        target_accept = true_trust >= 0.50
+        # relaxed accept target, but not too low
+        target_accept = true_trust >= 0.45
 
         # 1) Classification reward
         classification_reward = 1.0 if recommend == target_accept else -1.0
 
-        # 2) Threshold calibration reward
+        # 2) Calibration reward
+        # Helpful, but should not dominate the decision
         calibration_reward = 1.0 - abs(true_trust - threshold)
 
-        # 3) Penalize too-low threshold
+        # 3) Penalize thresholds that become too low
         low_threshold_penalty = 0.0
         if threshold < 0.30:
-            low_threshold_penalty = -(0.30 - threshold) * 1.2
+            low_threshold_penalty = -(0.30 - threshold) * 1.5
 
-        # 4) Penalize too-high threshold
+        # 4) Penalize thresholds that become too high
         high_threshold_penalty = 0.0
-        if threshold > 0.65:
-            high_threshold_penalty = -(threshold - 0.65) * 1.6
+        if threshold > 0.62:
+            high_threshold_penalty = -(threshold - 0.62) * 1.8
 
-        # 5) Penalize accepting low-trust products, but less aggressively than before
+        # 5) Penalize accepting low-trust products more strongly
         false_positive_penalty = 0.0
         if recommend and true_trust < 0.45:
-            false_positive_penalty = -(0.45 - true_trust) * 0.5
+            false_positive_penalty = -(0.45 - true_trust) * 1.2
 
-        # 6) Penalize rejecting strong products
+        # 6) Penalize rejecting clearly strong products
         false_negative_penalty = 0.0
-        if (not recommend) and true_trust > 0.70:
-            false_negative_penalty = -(true_trust - 0.70) * 1.3
+        if (not recommend) and true_trust > 0.65:
+            false_negative_penalty = -(true_trust - 0.65) * 1.0
 
-        # 7) Bonus for correctly accepting genuinely good products
+        # 7) Bonus for confidently accepting genuinely strong products
         good_accept_bonus = 0.0
         if recommend and true_trust > 0.65:
-            good_accept_bonus = (true_trust - 0.65) * 0.8
+            good_accept_bonus = (true_trust - 0.65) * 0.9
 
-        # 8) Quality support bonus
-        support_bonus = (
+        # 8) Base support score from product evidence
+        raw_support_score = (
             0.25 * true_rating +
             0.25 * verified_ratio +
             0.25 * review_confidence +
             0.25 * text_quality
         )
 
+        # 9) Gated support bonus
+        # Prevent support from always giving positive reward.
+        if true_trust >= 0.60:
+            support_bonus = raw_support_score
+        elif true_trust >= 0.45:
+            # only weak support in uncertain region
+            support_bonus = 0.35 * (raw_support_score - 0.5)
+        else:
+            # weak evidence should hurt low-trust products
+            support_bonus = -0.50 * (1.0 - raw_support_score)
+
+        # 10) Borderline-zone penalty
+        # Discourages blindly recommending products in the gray zone.
+        uncertain_recommend_penalty = 0.0
+        if recommend and 0.45 <= true_trust < 0.60:
+            uncertain_recommend_penalty = -(0.60 - true_trust) * 0.6
+
         reward = (
-            0.35 * classification_reward +
-            0.25 * calibration_reward +
-            0.20 * support_bonus +
+            0.34 * classification_reward +
+            0.16 * calibration_reward +
+            0.12 * support_bonus +
             good_accept_bonus +
             low_threshold_penalty +
             high_threshold_penalty +
             false_positive_penalty +
-            false_negative_penalty
+            false_negative_penalty +
+            uncertain_recommend_penalty
         )
+
+        # keep PPO training stable
+        reward = float(np.clip(reward, -3.0, 3.0))
 
         self.current_idx = int(np.random.randint(0, self.n_products))
         next_obs = self.product_features[self.current_idx].copy()
@@ -189,16 +212,18 @@ class TrustRLEnvironment(gym.Env if GYM_OK else object):
             "reward_breakdown": {
                 "classification_reward": classification_reward,
                 "calibration_reward": calibration_reward,
+                "raw_support_score": raw_support_score,
                 "support_bonus": support_bonus,
                 "good_accept_bonus": good_accept_bonus,
                 "low_threshold_penalty": low_threshold_penalty,
                 "high_threshold_penalty": high_threshold_penalty,
                 "false_positive_penalty": false_positive_penalty,
                 "false_negative_penalty": false_negative_penalty,
+                "uncertain_recommend_penalty": uncertain_recommend_penalty,
             },
         }
 
-        return next_obs, float(reward), False, False, info
+        return next_obs, reward, False, False, info
 
     def get_product_state(self, asin: str):
         idx_arr = np.where(self.product_asins == str(asin))[0]
